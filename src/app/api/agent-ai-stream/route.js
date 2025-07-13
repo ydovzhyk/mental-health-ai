@@ -1,15 +1,59 @@
 import { convertToCoreMessages, streamText, smoothStream } from 'ai';
 import { openai } from '@ai-sdk/openai';
 import MemoryClient from 'mem0ai';
+import path from 'path';
+import fs from 'fs/promises';
 import { promptMentalHealth } from '@/data/promts/promptMentalHealth';
 
-export const runtime = 'edge';
-
+// export const runtime = 'edge';
+export const runtime = 'nodejs';
 const mem0 = new MemoryClient({ apiKey: process.env.MEM0_API_KEY });
+const FILE_PATH = path.resolve(
+  process.cwd(),
+  'src',
+  'data',
+  'userConsent.json'
+);
+const saveSignalRegex = /\[TOOL: SAVE_HISTORY\]/i;
+const dontSaveSignalRegex = /\[TOOL: DONT_SAVE_HISTORY\]/i;
+
+const getConsent = async userId => {
+  try {
+    const file = await fs.readFile(FILE_PATH, 'utf-8');
+    const data = JSON.parse(file);
+    return data[userId]?.saveHistory;
+  } catch (e) {
+    return undefined;
+  }
+};
+
+const setConsent = async (userId, saveHistory) => {
+  let data = {};
+  try {
+    const file = await fs.readFile(FILE_PATH, 'utf-8');
+    data = JSON.parse(file);
+  } catch (e) {
+    console.error('Error reading consent file:', e.message || e);
+  }
+
+  data[userId] = { saveHistory };
+
+  await fs.writeFile(FILE_PATH, JSON.stringify(data, null, 2));
+
+  if (!saveHistory) {
+    try {
+      await mem0.deleteAll({ user_id: userId });
+    } catch (e) {
+      console.error(
+        `Error deleting memories for user ${userId}:`,
+        e.message || e
+      );
+    }
+  }
+};
 
 export async function POST(req) {
   const { messages, user_id, initial_greet } = await req.json();
-
   let memoryContext = '';
 
   if (initial_greet) {
@@ -19,7 +63,7 @@ export async function POST(req) {
         api_version: 'v2',
       });
 
-      console.log('Mem0 search result:', memSearch);
+      console.log('Mem0 search results in agent-ai:', memSearch);
 
       if (Array.isArray(memSearch) && memSearch.length > 0) {
         const formattedMemories = memSearch
@@ -31,9 +75,9 @@ export async function POST(req) {
           })
           .join('\n\n');
 
-        memoryContext = `This user has chatted with you before. Here is the summarized context with dates:\n\n${formattedMemories}\n\nIf the last message is older than 1 day, greet them gently with: "Welcome back. I'm here for you again. Above you can read our previous conversation, and I'm always here to support you. What would you like to talk about today?". Otherwise, just continue as usual.`;
+        memoryContext = `This user has chatted with you before. Here is the summarized context with dates:\n\n${formattedMemories}\n\nIf the last message is older than 1 day, greet them gently with: "Welcome back. I'm here for you again. Above you can read our previous conversation, and I'm always here to support you. What would you like to talk about today?". Otherwise, just continue as usual. Include a summary so that the user can remember what you talked about.`;
       } else {
-        memoryContext = `This is the user's first time. Please greet them warmly and invite them to share how they are feeling today.`;
+        memoryContext = ``;
       }
     } catch (e) {
       console.error('❌ Mem0 error during initial_greet:', e.message || e);
@@ -46,10 +90,6 @@ export async function POST(req) {
     .reverse()
     .find(msg => msg.role === 'user')?.content;
 
-  // const finalMessages = [
-  //   { role: 'system', content: promptMentalHealth },
-  //   ...messages,
-  // ];
 
   const finalMessages = [
     { role: 'system', content: promptMentalHealth },
@@ -60,7 +100,7 @@ export async function POST(req) {
   const result = await streamText({
     model: openai('gpt-4o'),
     messages: convertToCoreMessages(finalMessages),
-    temperature: 0.4,
+    temperature: 0.2,
     maxSteps: 5,
     experimental_transform: smoothStream({
       chunking: 'word',
@@ -70,40 +110,41 @@ export async function POST(req) {
 
   const streamResponse = result.toDataStreamResponse();
 
-  // Збираємо відповідь асистента для збереження
   let fullAssistantReply = '';
 
   async function collectAndSave() {
-    try {
-      for await (const delta of result.textStream) {
-        fullAssistantReply += delta;
-      }
+    for await (const delta of result.textStream) {
+      fullAssistantReply += delta;
+    }
+    console.log('Full assistant reply:', fullAssistantReply);
 
-      // Перевірка, чи бот вставив сигнал виклику тула
-      const saveSignalRegex = /\[TOOL: SAVE_HISTORY\]/i;
-      const shouldSave = saveSignalRegex.test(fullAssistantReply);
+    if (saveSignalRegex.test(fullAssistantReply)) {
+      await setConsent(user_id, true);
+    }
+    if (dontSaveSignalRegex.test(fullAssistantReply)) {
+      await setConsent(user_id, false);
+    }
 
-      if (shouldSave) {
-        // Видаляємо сигнал перед збереженням
-        const cleanedReply = fullAssistantReply
-          .replace(saveSignalRegex, '')
-          .trim();
+    const userConsent = await getConsent(user_id);
 
-        await mem0.add(
-          [
-            { role: 'user', content: userLastMessage },
-            { role: 'assistant', content: cleanedReply },
-          ],
-          {
-            user_id,
-            org_id: process.env.MEM0_ORG_ID,
-            project_id: process.env.MEM0_PROJECT_ID,
-            metadata: { question: userLastMessage },
-          }
-        );
-      }
-    } catch (e) {
-      console.error('Mem0 save error:', e.message || e);
+    if (userConsent) {
+      console.log('Saving conversation to Mem0...');
+      const cleanedReply = fullAssistantReply
+        .replace(saveSignalRegex, '')
+        .replace(dontSaveSignalRegex, '')
+        .trim();
+
+        await mem0.add([{ role: 'user', content: userLastMessage }], {
+          user_id,
+          org_id: process.env.MEM0_ORG_ID,
+          project_id: process.env.MEM0_PROJECT_ID,
+        });
+
+        await mem0.add([{ role: 'assistant', content: cleanedReply }], {
+          user_id,
+          org_id: process.env.MEM0_ORG_ID,
+          project_id: process.env.MEM0_PROJECT_ID,
+        });
     }
   }
 
